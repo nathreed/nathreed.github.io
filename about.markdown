@@ -4,15 +4,6 @@ title: About
 permalink: /about/
 ---
 
-This is the base Jekyll theme. You can find out more info about customizing your Jekyll theme, as well as basic Jekyll usage documentation at [jekyllrb.com](https://jekyllrb.com/)
+I am Nathan Reed. In my day job, I am a software engineer currently working on iOS applications. I have a wide variety of technical interests in addition to iOS development, including programming languages and compilers, operating systems, hardware from a high level, software reverse engineering, security, and more.  I’m very curious, always learning, and interested in a wide variety of nontechnical subjects, including transportation (especially aviation), cities, maps and geospatial stuff, and politics and government.
 
-You can find the source code for Minima at GitHub:
-[jekyll][jekyll-organization] /
-[minima](https://github.com/jekyll/minima)
-
-You can find the source code for Jekyll at GitHub:
-[jekyll][jekyll-organization] /
-[jekyll](https://github.com/jekyll/jekyll)
-
-
-[jekyll-organization]: https://github.com/jekyll
+You can find me on [LinkedIn](https://www.linkedin.com/in/nathan-reed-3224321a6/).
