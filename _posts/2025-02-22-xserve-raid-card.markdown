@@ -5,14 +5,34 @@ date:   2025-02-22 13:28:55 -0500
 description: In this post, I describe from start to finish how I reverse-engineered the communication between the Apple RAID Card and its macOS driver to write a basic Linux driver for it. To do this, I modified the QEMU hypervisor to facilitate tracing DMA (direct memory access) traffic between macOS and the device, wrote an emulated "digital twin" of the RAID Card as a QEMU device to validate and refine my understanding of the communication protocol, and finally wrote a "hackathon-quality" Linux driver for the emulated device and successfully tested it against the real hardware.
 ---
 
-
 In this post, I describe from start to finish how I reverse-engineered the communication between the Apple RAID Card and its macOS driver to write a basic Linux driver for it. To do this, I modified the QEMU hypervisor to facilitate tracing DMA traffic between macOS and the device, wrote an emulated "digital twin" of the RAID Card as a QEMU device to validate and refine my understanding of the communication protocol, and finally wrote a "hackathon-quality" Linux driver for the emulated device and successfully tested it against the real hardware.
 
 This was a long adventure full of twists and turns, many of which I won't describe here. My main goal was not to engineer a perfect Linux driver and contribute it upstream, to understand everything about the RAID Card, or to make choices at every juncture that were the optimal use of time or the best way to solve a problem. This was a personal project, so my goal was instead to maximize my learning and maximize the fun I had. Many of the choices and approaches I'll describe here make no sense from the standpoint of doing this the "right" way, but they did contribute to maximizing my learning and fun. 
 
 This post is not intended to fully explain all the technical concepts involved in this project, or even go into many details about the various pieces of the project. Other sources explain them better than I can in passing, and explaining the concepts and details here would take up too much space and distract from the interesting and novel parts of this project. I will try to link other resources in places where I assume certain knowledge.
 
-## Background
+# Table of contents
+
+- [Background](#background)
+- [Initial investigation](#initial-investigation)
+  - [Using a virtual machine to learn more](#using-a-virtual-machine-to-learn-more)
+- [Digging deeper into the traces](#digging-deeper-into-the-traces)
+- [Tracing DMA traffic](#tracing-dma-traffic)
+- [Understanding the SCSI commands](#understanding-the-scsi-commands)
+- [Building a "digital twin"](#building-a-digital-twin)
+  - [Memory addressing hiccup](#memory-addressing-hiccup)
+  - [Accelerating development by switching to Python](#accelerating-development-by-switching-to-python)
+  - [Understanding the second mystery memory addressing mode](#understanding-the-second-mystery-memory-addressing-mode)
+  - [Decoding SCSI sense data](#decoding-scsi-sense-data)
+  - ["Digital twin" wrap-up](#digital-twin-wrap-up)
+- [Writing a Linux driver](#writing-a-linux-driver)
+  - [Driver scaffolding](#driver-scaffolding)
+  - [Driver functionality](#driver-functionality)
+  - [Block device discovery and handling](#block-device-discovery-and-handling)
+  - [Driver development and testing on real hardware](#driver-development-and-testing-on-real-hardware)
+- [Conclusion](#conclusion)
+
+# Background
 
 In May 2023, I bought a 2009 Xserve from an online government surplus auction for about $120. It's a nice configuration, with dual 2.66 GHz quad-core Xeon processors for 8 cores total (Gainestown/Nehalem), dual redundant power supplies, and 24GB of RAM. It came populated with 3 Apple Drive Modules, Apple's proprietary hard drive carriers. 
 
@@ -26,7 +46,7 @@ And this question naturally sparked another:
 
 How hard could it be to write a driver for this device myself?
 
-## Initial investigation
+# Initial investigation
 
 When someone asks "how hard could it be?" about computing topics, there's a decent chance they don't know what they're talking about and the answer is frequently "rather difficult". In this case, both of those things turned out to be true: I had very little idea what I was getting myself into, and it turned out to be a lot. While I have a computer science degree and greatly enjoyed my computer architecture and operating systems classes, I/O was barely covered in the classes I took and device drivers weren't covered at all. Beyond that, I had absolutely no knowledge about PCI(e) or hard drives/RAID controllers and the communication standards they use. I don't do any of this sort of thing for my day job (I'm currently an iOS developer). In other words, I would need to learn a lot to make this project work.
 
@@ -44,7 +64,7 @@ The broad strokes of the post turn out to be correct–the card does have an emb
 
 Analysis and binary reverse-engineering of the card's firmware did not prove to be a productive way for me to understand the communication with the macOS host in enough detail to reproduce it in a Linux driver, so I turned to an alternate approach.
 
-### Using a virtual machine to learn more   
+## Using a virtual machine to learn more   
 
 My initial inspiration for the project, and the major reason I thought it might be feasible, was the work of the Asahi Linux team, bringing Linux and a bunch of device drivers to Macs with Apple Silicon chips. They're using a black-box reverse engineering approach [with a custom-built thin hypervisor to virtualize macOS and trace all its hardware accesses](https://asahilinux.org/2021/08/progress-report-august-2021/). From this, they're able to understand how the hardware works and write Linux drivers for it. Similar black-box reverse engineering work was done by the `nouveau` project to build a FOSS Linux driver for Nvidia GPUs, though they did MMIO tracing at the operating system level to capture accesses made by the running closed-source Linux driver. That approach would need significant adaptation to work here because there is no Linux driver to trace, so I'd have to modify the macOS kernel, a task for which there's significantly less documentation available. I wanted to take a virtualization-based approach like Asahi, but I don't have the expertise to write my own hypervisor, so I decided to use [QEMU](https://www.qemu.org) as a jumping-off point and modify it as needed.
 
@@ -118,13 +138,13 @@ vfio_region_read 527691.145 pid=1224 name=b'0000:01:00.0' index=0x0 addr=0x58 si
 vfio_region_write 58.127 pid=1224 name=b'0000:01:00.0' index=0x0 addr=0x59 data=0x0 size=0x1
 ```
 
-## Digging deeper into the traces
+# Digging deeper into the traces
 
 At this point, I was getting pretty annoyed with booting my Xserve from the USB flash drive and copying important files to the tmpfs every time so I could run stuff with acceptable performance. Booting took more than 5 minutes. To improve the situation, I bought a cheap SATA card and an SSD to boot Linux from, at this point completely negating the last shred of practical benefit this project could possibly have. This brought the boot time down to 1 minute. Now I was able to start collecting more traces and analyzing them in detail.
 
 The first insight that's almost immediately obvious from the trace excerpted above is that this can't possibly be all the communication between macOS and the card. The cycle of writing specific values to a small set of registers, interrupts, and reading specific values back from another small set of registers continued, with some values being incremented but otherwise not much change. This is clearly not enough variation to capture the variety of commands and responses we'd expect to see. Nor does it make sense for all the communication to be happening over memory-mapped I/O: this would consume an unnecessary amount of CPU time and isn't practical for moving the large quantities of data we'd expect from a storage device. Instead, the card is using [DMA](https://en.wikipedia.org/wiki/Direct_memory_access) to directly read and write to and from the Xserve's memory to transfer data. The incrementing nature of some of the values suggests that they are sequence numbers or otherwise related to some kind of command queueing mechanism, the interrupts are probably signals from the device that it's finished processing a command, and there are certain values that look awfully like memory addresses, likely used to set up the DMA areas for further communication.
 
-## Tracing DMA traffic
+# Tracing DMA traffic
 
 It was good to get the first real insights about the communication, but the use of DMA presented a problem: because of the *direct* nature of DMA, there's no way to trace it with QEMU's built-in trace events, so it wasn't immediately obvious how to collect traces of *all* communication between host and device. QEMU's trace events cover accesses the guest OS running in the VM makes to the hardware, but there's no way to tell when the RAID card writes into the Xserve's memory, and even if QEMU was set up to trace every single memory access the guest OS made, the performance for that would be unacceptably slow.
 
@@ -136,7 +156,7 @@ Dumping the entirety of the VM's RAM (I allocated 7 GiB to my VM) was not feasib
 
 I looked at the XML commands a bit and got a sense of what was going on (device status, the alerts warning about a failed battery, empty list of RAID volumes, etc), but it was clear that the SCSI commands would be the bigger challenge since they were binary, not text-based. At this point, I did a lot of research into the SCSI family of standards so that I had some background and understanding of what I was potentially looking at. 
 
-## Understanding the SCSI commands
+# Understanding the SCSI commands
 
 In order to have any shot at understanding the memory dumps I'd captured, I would need some idea of what I was looking for. I decided to start with understanding what SCSI does at a high level, so I could then maybe identify which pieces of the memory dumps corresponded to which high-level SCSI operations. To help with this, I read (parts of) a bunch of SCSI standards (SAM–SCSI Architectural Model, SPC–SCSI Primary Commands, SBC–SCSI Block Commands, and very small bits of a few others) to understand the architectural model and some of the operations/flows involved with some of the layers.
 
@@ -189,7 +209,7 @@ For a long time, I was operating under the assumption that the RAID Card only su
 
 Unfortunately, it was about this point in the project where I hit a brick wall. I had no idea what those two other methods could be, so I didn't really know what to look for. Just to be sure, I had tried extending my dumper program to detect the `02`-prefixed values, treat the 4 following bytes as a memory address, and dump there–dumping memory at `32 94 C0 00` for example, given the command above. I didn't get any results from this, despite checking and double-checking my endianness, dumper program, etc: that area of memory was definitely not changing. Because I wasn't making much progress trying to stare at the command bytes and derive more meaning from them (and therefore wasn't having very much fun), I decided to try a different approach. 
 
-## Building a "digital twin"
+# Building a "digital twin"
 
 At this point in the project, I had built some understanding of some parts of the host-device communication. Unfortunately, a lot of it was in the form of hand-wavy intuitions: I had a bunch of values that looked like they matched, a bunch of SCSI commands and partial responses that sort of decoded to valid results, a bunch of MMIO sequences that looked like DMA configuration if you squinted the right way, and so on. Also, the knowledge was either in my head or written down in vague sentence fragments in a quickly-growing note–not exactly conducive to rigorously exploring and refining parts of my understanding until I had a better idea of the whole thing. 
 
@@ -197,7 +217,7 @@ I decided it might be a good idea to write an emulated copy of the RAID Card to 
 
 The initial steps of the emulated copy came together in an iterative, straightforward (if not quick) fashion. I would make some changes to my emulated device code, recompile QEMU, and boot the virtual machine, each time getting the macOS driver to go a bit further in the PCI enumeration/driver binding process before it found a value it didn't like and errored out. Then I'd compare the output to the trace output from the real card, fix any differences, and see if macOS would go any further. Rinse and repeat a few dozen times, and I had macOS sending XML SOAP commands to my emulated device, just like it did for the first few commands to the real device. 
 
-### Memory addressing hiccup
+## Memory addressing hiccup
 
 I was excited to start poking at the SCSI commands with the `02` prefix in the memory addressing section, but when I finally got to the first command that had this, I was surprised to find that the `02` had been replaced with an `01`, a value I hadn't seen in the traces from the real device. Once again, dumping memory at the address given by the following 4 bytes yielded nothing. 
 
@@ -209,7 +229,7 @@ To figure out what was going on, I used the `info mtree` command in the QEMU con
 
 Unfortunately for me, QEMU doesn't reflect this hole when using a file to back the VM's memory. That is, the RAM file is 7 GiB while the complete GPA address space is 9 GiB. As a result, you have to subtract 2 GiB from GPAs higher than 4 GiB to find the offset in the RAM file where that data is actually stored. Using the example above, we have `02 32 94 C0 00` - `80 00 00 00` (2 GiB) = `01 B2 94 C0 00`, which matches what we observed above. This solved the mystery of the memory address sections starting with `02` and `01`–turns out they were just regular memory addresses, albeit 5-byte instead of 4-byte like I'd assumed–but it didn't illuminate what was going on with the commands that had `08 87`. Subtracting 2 GiB from `08 87 00 00 00` gives an address just past 34 GiB, and my VM's address space was only 9 GiB, so clearly this was not a memory address. Since macOS didn't start using that addressing mode until later in the sequence, I decided to come back to this issue later in the project and focus on emulating the next few commands first.
 
-### Accelerating development by switching to Python
+## Accelerating development by switching to Python
 
 At this point, I was once again starting to have less fun writing code for the project. As a QEMU device, the emulated RAID card was implemented in C. It was becoming a headache to manage the combination of static data with certain pieces dynamically modified, reading specific sequences of bytes from specific offsets, etc. I was spending too much time on silly pointer mistakes and not enough time making progress. In the interest of maximizing the fun on this project, I decided to take a different approach: the C-implemented QEMU device would just be a "stub" that would convert between the PCI MMIO/DMA accesses and a custom protocol I would develop. It would communicate over a Unix socket with another program implementing that custom protocol and emulating the state and behavior for the SCSI and XML commands. I could then write the other program in another language that was easier to develop quickly in. 
 
@@ -225,7 +245,7 @@ This protocol was easy to read and write from both the C and Python sides. It al
 
 Using the same iterative approach as before, making the output look just like the real device to make macOS go further and further, I implemented all the commands I had before, except in a much faster, cleaner, and more extensible manner, and then a few more. Unfortunately, I soon ran into commands using the other "mystery" memory addressing model from above: the ones that included `08 87 00 00 00`. Thankfully, this was exactly why I had started building the "digital twin": to make it easier faster to try out new ideas and possibilities and grow my understanding of the communication between host and device.
 
-### Understanding the second mystery memory addressing mode
+## Understanding the second mystery memory addressing mode
 
 As discussed above, I had some commands that looked like this:
 
@@ -256,7 +276,7 @@ There were a few instances where the device seemed to write a few more bytes tha
 
 It seemed pretty clear that the number at the end of the list entry was the rounded-up number of 4-byte words to transfer for that entry, so that was one more piece of the puzzle decoded (with the added bonus that I'd made a connection between the scatter-gather list entry format and the memory addressing section format in "regular" commands). With this additional knowledge, it was straightforward to extend my dumper program to support scatter-gather lists. Now I finally had dumps of all the communication, a major milestone in this project. After extending the memory dumper and verifying that I was getting the data I expected from the real device, I also extended my emulated copy to include what I'd learned about the scatter-gather lists. 
 
-### Decoding SCSI sense data
+## Decoding SCSI sense data
 
 At this point, I had identified almost every piece of the SCSI protocol puzzle in my DMA traffic dumps. Basically the only important thing I was missing was the sense data, and luckily I was able to use process of elimination to locate and decode it. The initial MMIO setup, early in the traces, told the device about base addresses for six different memory regions. I had successfully identified uses for five of them (SCSI commands, SCSI command queue completion [ring buffer](https://en.wikipedia.org/wiki/Circular_buffer), XML commands, XML responses, and DMA scatter-gather lists), so there was only one possibility left.
 
@@ -271,15 +291,15 @@ I assumed that the last unknown memory region I was dumping must contain the SCS
 
 Two important pieces of the SCSI sense data are the "Additional Sense Code" (ASC) and the "Additional Sense Code Qualifier" (ASCQ). The combination of these two values identify a certain condition relating to the failure of the command. Since there are limited nonzero two-byte sequences in what I assumed was the sense data, I just guessed about which two bytes were the ASC and ASCQ. It turns out that the `3F 0E` in the example above are the relevant two bytes, in this case indicating a status of `REPORTED LUNS DATA HAS CHANGED`. The other different dumps had ASC/ASCQ pairs that made sense (`POWER ON OCCURRED`, `INVALID FIELD IN PARAMETER LIST`, `INVALID FIELD IN CDB`), and it was pretty clear that this was the so-called "fixed-format" sense data from the SCSI specification (there are only two options, fixed-format or variable descriptor-based). I was also able to guess and verify that the `02` byte at index 6 was the SCSI status code, in this case indicating a status of `CHECK CONDITION`, which means that sense data will be present (due to some exceptional status encountered with the processing of the command).
 
-### "Digital twin" wrap-up
+## "Digital twin" wrap-up
 
 Now that I had all the major pieces of the SCSI communication figured out, I could proceed with emulating the full set of commands I had observed macOS sending to the real device. Unfortunately, macOS only sends a majority of these commands once you've configured a volume in RAID Utility, which communicates with the card over the XML SOAP interface, so I had to emulate that as well. Once again, this was a very iterative process, using mostly static data changed only the minimum amount for macOS to continue sending more commands. This was mostly unremarkable, but I did find that the SOAP interface has yet another way to send SCSI commands to the physical disks as opposed to logical units. This is used to [tunnel ATA commands](https://en.wikipedia.org/wiki/SCSI_/_ATA_Translation) that enable SMART reporting through to the physical disks. Let's just say that ATA commands wrapped in SCSI commands wrapped in XML are not the prettiest thing in the world. 
 
 After implementing all the necessary commands for the XML interface and a few more miscellaneous SCSI commands, it was time to handle the actual disk I/O. I implemented the READ and WRITE commands, storing the data in sparse files so that I could have a 1TB disk image (to minimize the modifications to the static data dumped from the device) without taking up 1TB of space. I booted the macOS VM, ran through the RAID volume creation, and watched as macOS sent write commands that were handled for the first time by my "digital twin". I mounted the resulting disk images from my host Mac and was able to read files I put on them from the guest macOS, indicating that everything was working properly. This meant my emulation was finally good enough to handle everything I needed it to -- it was a good enough facisimile of the real thing for macOS to get all the way through formatting a disk and storing files on it. This also meant that it was good enough for me to start on a Linux driver!
 
-## Writing a Linux driver
+# Writing a Linux driver
 
-### Driver scaffolding 
+## Driver scaffolding 
 My high-level plan was to write a Linux driver for the emulated "digital twin", using a minimal kernel build in a virtual machine for the fastest iteration. Then, once I had the driver working, I would test it on the real hardware. Before this project, I had very limited experience working in the Linux kernel–just one simple project for my operating systems class in college, so I didn't really know what I was doing beyond the high-level plan. The first order of business was setting up a development environment. I found a [guide](https://gist.github.com/ncmiller/d61348b27cb17debd2a6c20966409e86) for setting up a minimal system with a kernel build and BusyBox userspace and adapted it to work on arm64 so I could develop on my Mac. I ran the whole build process from a Linux VM, which made the iteration process rather convoluted: I would edit my files in a VSCode remote window connected to the Linux VM over SSH, build the kernel in the VM, then copy the boot image back out to macOS and use it with QEMU (and the emulated device via the Python unix socket server) to boot a second VM with my custom kernel. 
 
 After some research into the Linux block and SCSI subsystems, I decided to write the driver as a [block device](https://en.wikipedia.org/wiki/Device_file#Block_devices), not as a SCSI device. Although the macOS driver appears to be written as a SCSI device, I wasn't sure if the RAID Card implemented the entire SCSI command set or just certain commands that macOS was known to send. I also wasn't sure how certain other pieces of the SCSI specifications were implemented, like Task Management Functions (command cancellation, etc). I decided it would be easier to present a higher level of abstraction to Linux, which would allow me to use only the SCSI stuff I knew for sure the device supported. This is definitely one of the choices I made in the interest of expediency and having fun on this project at the expense of "doing it right"–a SCSI driver is almost certainly the "right" choice for this device, but would have taken me a lot longer to get working.  
@@ -288,7 +308,7 @@ For me, the hardest part of starting some additions in a new codebase is figurin
 
 To write a Linux device driver, you need to implement the correct "interfaces" for your device. In my case, I needed to implement functions to deal with a PCI device and functions to expose a block device. The job of my driver would be to bridge between the block device functions (things like "submit read/write operation") and the PCI device functions (things like "write this MMIO register" or "set up a DMA transfer").
 
-### Driver functionality
+## Driver functionality
 
 Linux has a number of abstractions that let drivers avoid most of the detail required to deal with the computer's hardware. For example, it's just one or two function calls to allocate some memory and set it up to be used with DMA, the end result being a bus address you can give to the device to use for DMA. Device driver programming feels very much like regular C programming with a fully-featured library of common functionality. The driver code can be surprisingly high level, with the only real complexity being that which is inherent to the device the driver is working with. Perhaps the only notable exception that a driver programmer has to be aware of is the context in which their code is running: whether in response an interrupt or in a more normal kernel execution context (worker thread/in response to a system call).
 
@@ -303,19 +323,19 @@ Roughly speaking, the command processing flow in my driver looks like this:
 
 The kernel has powerful primitives for a lot of this work, including "waitqueues" (used to block submitting a new command until a command slot is available in step 1) and "workqueues" (used to submit work for asynchronous processing outside of the interrupt handler in step 3/4). The rest of the work is just mapping the buffers for DMA and dealing with the MMIO registers that are specific to the device, so it isn't very difficult to implement. 
 
-### Block device discovery and handling
+## Block device discovery and handling
 
 In order to be able to read and write the RAID volumes from userspace, we need to expose a [block device](https://en.wikipedia.org/wiki/Device_file#Block_devices) to the system. To do that, we need certain information about the device: things like the block size and the number of blocks there are (capacity of the device). In my case, I need to query the RAID Card for that information, since it could be exposing any number of volumes of varying sizes (each of which will be exposed as a separate block device). After my driver is finished with the initial setup of the device, it kicks off a series of commands that will discover this information. Specifically, it issues a REPORT LUNS command to get the list of logical units, and then it issues MODE SENSE commands to each logical unit to get their capacity and block size. Once each logical unit's capacity is known, it is registered as a block device with the system, which triggers the block layer to issue commands reading the partition table of the disk and setting up those partitions for the rest of the system to use.
 
 There are several interfaces you can use to write a Linux block driver. I chose to write a "bio-based" driver, which felt like the easiest way to get going quickly. `bio`, short for "block I/O" is the name of a struct that represents an I/O operation on a block device. A `bio` can describe an operation in either the read or the write direction, not both. A `bio` is made up of one or more `bvec`s, each of which describes a region of bytes to transfer by memory offset and length. A bio-based driver only needs to implement a "submit bio" function in order to work. In my case, the "submit bio" function just transforms the `bio` into a SCSI READ or WRITE command for submission to the device. Later, when the SCSI command has completed, there's a `bio_endio` function that is called to notify the block layer that the `bio` has completed. I was able to copy the `n64cart` block device driver (for Nintendo 64 cartridges), a simple bio-based driver, for a lot of the basic scaffolding and operations. 
 
-### Driver development and testing on real hardware
+## Driver development and testing on real hardware
 
 Overall, the kernel driver came together relatively quickly. I did encounter a few stumbling blocks along the way–for example, I had significant difficulty getting the block device registered with the kernel and getting the kernel to scan for partitions–but debugging was made a lot easier by the fact that I could easily see what the other side of the code was trying to do, add print statements or temporarily bypass checks, and things like that. Of course, I ran into the typical C memory management mistakes, but they were, for the most part, easy to fix. The kernel has a number of helpful debugging tools, perhaps the most useful in this instance being KASan (Kernel Address Sanitizer), which instruments the kernel with the same kind of runtime checks as [ASan](https://github.com/google/sanitizers/wiki/addresssanitizer) does in userspace code and helps the programmer find all sorts of memory management bugs. 
 
 I decided I was "finished" writing the driver when I had gotten it to successfully read a SCSI logical unit with an EFI and HFS+ partition from the emulated "digital twin". At that point, it was finally time to test the driver with the real device. I compiled the kernel for x86 and set up a QEMU VM with the same BusyBox userspace I'd been developing with. This time, I passed through the real RAID Card with VFIO and...it worked the first time! I was able to mount an HFS+ partition I'd created from the macOS VM and read a file from it. I was very pleased that it worked the first time, as it meant I wouldn't need to spend hours debugging it with the loud roar of the Xserve fans in the background. I think the strategy of building a "digital twin" of reasonable fidelity paid off tremendously, as it not only enabled me to iterate quickly on the driver but also to organize, formalize, and validate all the knowledge I'd gathered about the device and its communication. Of course, as soon as I had it working, my interest in fixing up the rough edges or characterizing/improving the performance was dramatically reduced, but that's OK. Maybe I'll get to it sometime as another project. 
 
-## Conclusion
+# Conclusion
 
 This was the largest, most complex personal project I've ever done, by far. I learned so many new things, from the basics of setting up a VM with PCIe passthrough, to nitty-gritty details about memory-mapped I/O and DMA, to writing a real device driver running in the Linux kernel. I learned about the PCI(e) and SCSI families of specifications in more detail than I had ever thought I'd need. There were a bunch of side quests I didn't even mention here, like a detour into the world of (U)EFI firmware drivers. Along the way, my insatiable curiosity about, and incredible fascination with, the way computers work was one of the things that kept me going. One of the major takeaways I got from my college computer science education is that there's no magic in computing, only layers of abstraction. One of my favorite things about having software skills is that I am empowered to pull apart those layers of abstraction as far as I want to and see how they work inside. Understanding how complex systems work from end to end is incredibly satisfying to me, and the combination of software skills, research skills, and open-source software to poke through means that, given enough time and effort, I can teach myself enough to get a decent understanding of how many complex systems work. Although my "how hard could it possibly be" spirit at the beginning of this project may have been misplaced, I'm glad I started this project based on it. If I had known how much work it would end up being, I probably wouldn't have done it, but then I wouldn't have had nearly as much fun or learned nearly as much as I did.
 
