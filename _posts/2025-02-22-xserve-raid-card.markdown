@@ -357,7 +357,7 @@ I decided I was "finished" writing the driver when I had gotten it to successful
 
 | ![screenshot of terminal output with a bunch of kernel output and the line "hello from the real life Apple RAID Card" at the bottom, output from the cat command.](/assets/raid_card/final_output.jpeg) |
 |:--:|
-| *The output from a `cat` command on the Linux VM the first time I tested my driver with the real hardware. I was reading a file I had placed on a RAID volume from macOS.* |
+| *The output from a `cat` command (mixed with the QEMU console and kernel output) on the Linux VM the first time I tested my driver with the real hardware. I was reading a file I had placed on a RAID volume from macOS.* |
 
 ## Conclusion
 
