@@ -259,7 +259,7 @@ Using the same iterative approach as before, making the output look just like th
 
 | ![diagram of "digital twin" used to formalize and expand my knowledge about the RAID Card](/assets/raid_card/digital_twin.png) |
 |:--:|
-| *The final setup for the "digital twin". macOS runs in a VM on my x86 MacBook Pro, communicating with the "stub" QEMU device in C. This translates the commands to my custom protocol and sends them over the Unix socket to the Python app, which backs up the SCSI logical units with disk image files.* |
+| *The final setup for the "digital twin". macOS runs in a VM on my x86 MacBook Pro, communicating with the "stub" QEMU device in C. This translates the commands to my custom protocol and sends them over the Unix socket to the Python app, which implements all the SCSI commands, backing up the logical units with disk image files.* |
 
 ### Understanding the second mystery memory addressing mode
 
@@ -320,7 +320,7 @@ My high-level plan was to write a Linux driver for the emulated "digital twin", 
 
 | ![diagram showing setup described above for developing the Linux driver against the digital twin](/assets/raid_card/driver_development.png) |
 |:--:|
-| *My setup for development of the Linux driver. I developed the driver against the "digital twin" attached to an `arm64` virtual machine and handled the few x86-specific differences at the last minute.* | 
+| *My setup for development of the Linux driver. I developed the driver against the "digital twin" attached to an arm64 virtual machine and handled the few x86-specific differences at the last minute.* | 
 
 After some research into the Linux block and SCSI subsystems, I decided to write the driver as a [block device](https://en.wikipedia.org/wiki/Device_file#Block_devices), not as a SCSI device. Although the macOS driver appears to be written as a SCSI device, I wasn't sure if the RAID Card implemented the entire SCSI command set or just certain commands that macOS was known to send. I also wasn't sure how certain other pieces of the SCSI specifications were implemented, like Task Management Functions (command cancellation, etc). I decided it would be easier to present a higher level of abstraction to Linux, which would allow me to use only the SCSI stuff I knew for sure the device supported. This is definitely one of the choices I made in the interest of expediency and having fun on this project at the expense of "doing it right"–a SCSI driver is almost certainly the "right" choice for this device, but would have taken me a lot longer to get working.  
 
